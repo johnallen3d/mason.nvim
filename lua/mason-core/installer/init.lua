@@ -8,6 +8,7 @@ local InstallContext = require "mason-core.installer.context"
 local settings = require "mason.settings"
 local linker = require "mason-core.installer.linker"
 local control = require "mason-core.async.control"
+local registry_installer = require "mason-core.installer.registry"
 
 local Semaphore = control.Semaphore
 
@@ -117,35 +118,39 @@ function M.execute(handle, opts)
         handle:on("stderr", append_log)
     end
 
-    log.fmt_info("Executing installer for %s", pkg)
-    return Result.run_catching(function()
-        -- 1. run installer
-        a.wait(function(resolve, reject)
-            local cancel_thread = a.run(M.exec_in_context, function(success, result)
-                if success then
-                    resolve(result)
-                else
-                    reject(result)
-                end
-            end, context, pkg.spec.install)
+    local installer = pkg.spec.schema ~= nil and registry_installer.compile(handle.package.spec, opts)
+        or Result.success(pkg.spec.install)
 
-            handle:once("terminate", function()
-                handle:once("closed", function()
-                    reject "Installation was aborted."
+    log.fmt_info("Executing installer for %s version=%s", pkg, opts.version or "latest")
+    return installer
+        :map_catching(function(entrypoint)
+            -- 1. run installer
+            a.wait(function(resolve, reject)
+                local cancel_thread = a.run(M.exec_in_context, function(success, result)
+                    if success then
+                        resolve(result)
+                    else
+                        reject(result)
+                    end
+                end, context, entrypoint)
+
+                handle:once("terminate", function()
+                    handle:once("closed", function()
+                        reject "Installation was aborted."
+                    end)
+                    cancel_thread()
                 end)
-                cancel_thread()
             end)
+
+            -- 2. promote temporary installation dir
+            context:promote_cwd()
+
+            -- 3. link package
+            linker.link(context)
+
+            -- 4. write receipt
+            write_receipt(context)
         end)
-
-        -- 2. promote temporary installation dir
-        context:promote_cwd()
-
-        -- 3. link package
-        linker.link(context)
-
-        -- 4. write receipt
-        write_receipt(context)
-    end)
         :on_success(function()
             permit:forget()
             handle:close()

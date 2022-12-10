@@ -210,6 +210,10 @@ local function setup_handle(handle)
             mutate_package_grouping(handle.package, "queued", true)
         elseif handle.state == "ACTIVE" then
             mutate_package_grouping(handle.package, "installing", true)
+        elseif handle.state == "CLOSED" then
+            mutate_state(function(state)
+                state.packages.states[handle.package.name].is_terminated = false
+            end)
         end
     end
 
@@ -264,7 +268,6 @@ local function setup_handle(handle)
     handle_spawnhandle_change()
     mutate_state(function(state)
         state.packages.states[handle.package.name] = create_initial_package_state()
-        state.packages.states[handle.package.name].short_tailed_output = "Installing…"
     end)
 end
 

@@ -10,12 +10,14 @@ local receipt = require "mason-core.receipt"
 local fs = require "mason-core.fs"
 local path = require "mason-core.path"
 local linker = require "mason-core.installer.linker"
+local Result = require "mason-core.result"
+local Purl = require "mason-core.purl"
 
 local version_checks = require "mason-core.package.version-check"
 
 ---@class Package : EventEmitter
 ---@field name string
----@field spec PackageSpec
+---@field spec RegistryPackageSpec | PackageSpec
 ---@field private handle InstallHandle The currently associated handle.
 local Package = setmetatable({}, { __index = EventEmitter })
 
@@ -56,16 +58,45 @@ local PackageMt = { __index = Package }
 ---@field languages PackageLanguage[]
 ---@field install async fun(ctx: InstallContext)
 
----@param spec PackageSpec
+---@class RegistryPackageSource
+---@field id string PURL-compliant identifier.
+
+---@class RegistryPackageSpec
+---@field schema '"registry+v1"'
+---@field name string
+---@field description string
+---@field homepage string
+---@field licenses string[]
+---@field languages string[]
+---@field categories string[]
+---@field source RegistryPackageSource
+---@field bin table<string, string>
+
+---@param spec PackageSpec | RegistryPackageSpec
 function Package.new(spec)
-    vim.validate {
-        name = { spec.name, "s" },
-        desc = { spec.desc, "s" },
-        homepage = { spec.homepage, "s" },
-        categories = { spec.categories, "t" },
-        languages = { spec.languages, "t" },
-        install = { spec.install, "f" },
-    }
+    if spec.schema == "registry+v1" then
+        vim.validate {
+            name = { spec.name, "s" },
+            description = { spec.description, "s" },
+            homepage = { spec.homepage, "s" },
+            licenses = { spec.licenses, "t" },
+            categories = { spec.categories, "t" },
+            languages = { spec.languages, "t" },
+            source = { spec.source, "t" },
+            bin = { spec.bin, { "t", "nil" } },
+        }
+        -- For compatibility with the old PackageSpec structure.
+        spec.desc = spec.description
+    else
+        vim.validate {
+            name = { spec.name, "s" },
+            desc = { spec.desc, "s" },
+            homepage = { spec.homepage, "s" },
+            categories = { spec.categories, "t" },
+            languages = { spec.languages, "t" },
+            install = { spec.install, "f" },
+        }
+    end
 
     return EventEmitter.init(setmetatable({
         name = spec.name, -- for convenient access
@@ -107,19 +138,25 @@ function Package:install(opts)
         end)
         :or_else_get(function()
             local handle = self:new_handle()
-            -- This function is not expected to be run in async scope, so we create
-            -- a new scope here and handle the result callback-style.
             a.run(
-                function(...)
-                    -- we wrap installer.execute for testing purposes (to allow spy objects)
-                    return installer.execute(...)
-                end,
+                installer.execute,
                 ---@param success boolean
                 ---@param result Result
                 function(success, result)
                     if not success then
+                        -- Installer failed abnormally (i.e. unexpected exception in the installer code itself).
                         log.error("Unexpected error", result)
                         self:emit("install:failed", handle)
+                        registry:emit("package:install:failed", self, handle)
+
+                        -- We terminate _after_ emitting failure events because termination -> failed is handled
+                        -- differently than failed -> terminate in the :Mason UI window (termination -> failed is
+                        -- interpreted as a user-triggered termination and is interpreted differently).
+                        if not handle:is_closed() and not handle.is_terminated then
+                            handle.stdio.sink.stderr(tostring(result))
+                            handle.stdio.sink.stderr "\nInstallation failed abnormally. Please report this error."
+                            handle:terminate()
+                        end
                         return
                     end
                     result
@@ -186,18 +223,56 @@ end
 
 ---@param callback fun(success: boolean, version_or_err: string)
 function Package:get_installed_version(callback)
-    a.run(function()
-        local receipt = self:get_receipt():or_else_throw "Unable to get receipt."
-        return version_checks.get_installed_version(receipt, self:get_install_path()):get_or_throw()
-    end, callback)
+    if self.spec.schema == "registry+v1" then
+        local resolve = _.curryN(callback, 2)
+        self:get_receipt()
+            :ok_or("Unable to get receipt.")
+            :map(_.path { "primary_source", "id" })
+            :and_then(function(id)
+                return Purl.parse(id):map(_.prop "version")
+            end)
+            :on_success(resolve(true))
+            :on_failure(resolve(false))
+    else
+        a.run(function()
+            local receipt = self:get_receipt():or_else_throw "Unable to get receipt."
+            return version_checks.get_installed_version(receipt, self:get_install_path()):get_or_throw()
+        end, callback)
+    end
 end
 
 ---@param callback fun(success: boolean, result_or_err: NewPackageVersion)
 function Package:check_new_version(callback)
-    a.run(function()
-        local receipt = self:get_receipt():or_else_throw "Unable to get receipt."
-        return version_checks.get_new_version(receipt, self:get_install_path()):get_or_throw()
-    end, callback)
+    if self.spec.schema == "registry+v1" then
+        self:get_installed_version(function(success, installed_version)
+            if not success then
+                return callback(false, installed_version)
+            end
+            local resolve = _.curryN(callback, 2)
+            Purl.parse(self.spec.source.id)
+                :and_then(
+                    ---@param purl Purl
+                    function(purl)
+                        if purl.version and installed_version ~= purl.version then
+                            return Result.success {
+                                name = purl.name,
+                                current_version = installed_version,
+                                latest_version = purl.version,
+                            }
+                        else
+                            return Result.failure "Package is not outdated."
+                        end
+                    end
+                )
+                :on_success(resolve(true))
+                :on_failure(resolve(false))
+        end)
+    else
+        a.run(function()
+            local receipt = self:get_receipt():or_else_throw "Unable to get receipt."
+            return version_checks.get_new_version(receipt, self:get_install_path()):get_or_throw()
+        end, callback)
+    end
 end
 
 function Package:get_lsp_settings_schema()

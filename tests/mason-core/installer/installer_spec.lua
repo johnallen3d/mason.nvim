@@ -1,6 +1,7 @@
 local stub = require "luassert.stub"
 local spy = require "luassert.spy"
 local match = require "luassert.match"
+local stub = require "luassert.stub"
 local fs = require "mason-core.fs"
 local a = require "mason-core.async"
 local path = require "mason-core.path"
@@ -44,7 +45,8 @@ describe("installer", function()
                 error("something went wrong. don't try again.", 0)
             end)
             local handler = InstallHandleGenerator "dummy"
-            handler.package.spec.install = installer_fn
+            stub(handler.package.spec,"install")
+            handler.package.spec.install.invokes(installer_fn)
             local result = installer.execute(handler, {})
             assert.spy(installer_fn).was_called(1)
             assert.is_true(result:is_failure())
